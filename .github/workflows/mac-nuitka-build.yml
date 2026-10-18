@@ -1,0 +1,94 @@
+# Copyright (c) 2026 Qianyuan Wuji Group (WUJILabs)
+# 无界填充 Mac 核心模块原生编译（Nuitka → .so）· 必须在真 Mac 上编
+#
+# macOS 的原生扩展（.so）只能在 macOS 上编，Windows / Linux 主机造不出。本工作流在 GitHub 托管的
+# 真 Mac（macos-14 = Apple 芯片，macos-13 = Intel）上，用随包同小版本的 CPython 3.12 跑 Nuitka，
+# 把皇冠珠宝模块（browser_client / unified_server / client / tool_calling / ps_refine）编成原生 .so，
+# 删掉对应 .py/.pyc，再做客观校验（Mach-O 原生二进制 / 无 .py 无 .pyc / strings 抓不到成片源码），
+# 把硬化后的 doubao2api 作为 artifact 传回。打包者用这批 .so 替换分发包里对应模块即得原生 Mac 包。
+#
+# 输入 app_url：一个 .tar.gz 的临时下载地址（如 COS 预签名，同 mac-smoke 走 COS 那套），内容是
+# 打完补丁、尚未硬化的引擎暂存目录（打包者在有引擎源码的开发机上准备，解压后结构为）：
+#   harden_engine.py            ← installer/harden_engine.py 原样拷入（tar 顶层）
+#   engine/doubao2api/*.py       ← 已 apply_patches、未硬化的引擎包
+#   pybss-<arch>.tar.gz          ← （可选）随包的 python-build-standalone 3.12，用它编 ABI 最贴合；
+#                                   缺省则用 actions/setup-python 的 3.12（同属 CPython 3.12，ABI 通用）
+# 准备方式（开发机，mktemp 工作区即可）：
+#   git -C <engine-repo> archive <锁定提交> | tar -x -C engine && \
+#   python bridge/apply_patches.py engine && cp installer/harden_engine.py . && \
+#   tar -czf app.tar.gz harden_engine.py engine [pybss-<arch>.tar.gz]
+# 再把 app.tar.gz 传到临时地址，手动 workflow_dispatch 本工作流并填 app_url。
+name: mac-nuitka-build
+on:
+  workflow_dispatch:
+    inputs:
+      app_url: { description: "打过补丁未硬化的引擎暂存目录 tar.gz 下载地址", required: true }
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, arch: arm64 }
+          - { runner: macos-13, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - name: 取打过补丁的引擎暂存目录
+        env: { URL: "${{ inputs.app_url }}" }
+        run: |
+          uname -m; sw_vers
+          curl -fsSL -o app.tar.gz "$URL"
+          mkdir app && tar -xzf app.tar.gz -C app --strip-components=0
+          ls -la app
+          test -f app/harden_engine.py
+          test -d app/engine/doubao2api
+      - name: 备好 CPython 3.12（优先随包 python-build-standalone，保证 ABI 与分发包一致）
+        id: py
+        run: |
+          set -e
+          PB="$(ls app/pybss-*.tar.gz 2>/dev/null | head -1 || true)"
+          if [ -n "$PB" ]; then
+            mkdir pybss && tar -xzf "$PB" -C pybss
+            PY="$(ls pybss/python/bin/python3.12 2>/dev/null || ls pybss/*/bin/python3.12 2>/dev/null | head -1)"
+            echo "用随包 python-build-standalone：$PY"
+          fi
+          echo "py=$PY" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        if: steps.py.outputs.py == ''
+        with: { python-version: "3.12" }
+      - name: 装 Nuitka
+        run: |
+          PY="${{ steps.py.outputs.py }}"; [ -z "$PY" ] && PY="$(which python3.12 || which python3)"
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install nuitka
+          "$PY" -m nuitka --version
+      - name: Nuitka 原生编译核心模块 → .so（不签名；签名在打包机带私钥时做）
+        run: |
+          "$PY" -X utf8 app/harden_engine.py app/engine --no-sign \
+            --nuitka --nuitka-python "$PY"
+      - name: 客观校验 .so（原生二进制 / 无源码 / 无 .py 无 .pyc）
+        run: |
+          set -e
+          PKG=app/engine/doubao2api
+          fail=0
+          for m in browser_client unified_server client tool_calling ps_refine; do
+            SO="$(ls "$PKG/$m".*.so "$PKG/$m.so" 2>/dev/null | head -1 || true)"
+            if [ -z "$SO" ]; then echo "⚠ $m 未编成 .so（已如实降级 .pyc）"; continue; fi
+            echo "== $m → $SO"
+            file "$SO" | grep -qiE "Mach-O|shared library" || { echo "✗ $m 不是 Mach-O 原生库"; fail=1; }
+            test ! -f "$PKG/$m.py"  || { echo "✗ $m 仍有 .py"; fail=1; }
+            test ! -f "$PKG/$m.pyc" || { echo "✗ $m 仍有 .pyc"; fail=1; }
+            # 成片源码不得残留（符号名/字符串常量可残留，属已知残余风险）
+            if strings "$SO" | grep -qE "async def generate_image|def build_instruction|_ps_license_gate\(request\)"; then
+              echo "✗ $m 的 .so 里出现成片源码行"; fail=1
+            fi
+          done
+          test "$fail" = 0
+      - name: 打包硬化产物
+        run: tar -czf "doubao2api-hardened-${{ matrix.arch }}.tar.gz" -C app/engine doubao2api
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "doubao2api-hardened-${{ matrix.arch }}"
+          path: "doubao2api-hardened-${{ matrix.arch }}.tar.gz"
